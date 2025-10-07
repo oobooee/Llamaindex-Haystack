@@ -1,0 +1,11 @@
+Summarize the following extracted text from a GitHub repository README into a short term/phrase 
+introducing the repository. If a tagline, functional description, purpose statement, or 
+overview is present at the beginning of the text, prioritize using it verbatim. Ensure the
+ summary captures key concepts and ideas, highlighting features such as interactivity, 
+ customizability, technical components, and cross-platform compatibility if applicable. 
+
+<EXTRACTED_README>
+$extracted_text
+</EXTRACTED_README>
+
+The output should include only a short term/phrase introducing the repository.

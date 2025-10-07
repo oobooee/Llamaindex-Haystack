@@ -1,0 +1,4 @@
+Summarize the following extracted text from a Github repository README into a short term/phrase introducing the repository. You should always try to look for an existing project tagline, functional description, purpose statement, or overview at the beginning of the extracted text and prioritize using this exact sentence or phrase. Ensure the output closely matches the original phrasing when appropriate. The output should include only a brief term/phrase introducing the repository.  
+<EXTRACTED_README>  
+$extracted_text  
+</EXTRACTED_README>

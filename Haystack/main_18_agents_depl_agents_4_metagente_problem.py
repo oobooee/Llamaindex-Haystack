@@ -1,0 +1,226 @@
+import json
+from haystack.tools import tool, Toolset
+from haystack.dataclasses import ChatMessage
+from haystack.components.generators.chat import AzureOpenAIChatGenerator
+from haystack.components.agents import Agent
+from haystack.utils import Secret
+from haystack.dataclasses import ChatMessage, ChatRole, ToolCallResult
+import sys
+from rouge_score import rouge_scorer
+# === CONFIG AZURE LLM ===
+subscription_key = ""
+endpoint = ""
+deployment = "gpt-4o"
+
+llm = AzureOpenAIChatGenerator(
+    azure_endpoint=endpoint,
+    api_key=Secret.from_token(subscription_key),
+    azure_deployment=deployment
+)
+
+
+@tool(name="rouge_l_score", description="Calculate ROUGE-L F1 score between a generated string and a reference string.")
+def rouge_l_score(generated: str, reference: str) -> float:
+    """
+    Compute ROUGE-L F1 score between generated and reference strings.
+    Returns a float between 0 and 1.
+    """
+    print(f"\033[94m[INFO -ROUGE SCORE]'{generated}'  ------------  {reference}")
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    score = scorer.score(reference, generated)
+    rougue_l_f1 = round(score["rougeL"].fmeasure, 4)
+    print(f"\033[94m[METRIC] ROUGE-L F1 score: {rougue_l_f1}\033[0m")
+    return rougue_l_f1
+
+
+
+
+@tool(name="agent_builder")
+def agent_builder(input_text: str) -> str:
+    try:
+        data = json.loads(input_text)
+        base_name = data.get("name", "agent_dynamic")
+        prompt = data["prompt"]
+        print(f"\033[94m[INFO] Creating tool '{base_name}' with prompt:\033[0m\n{prompt}")
+        existing_names = {tool.name for tool in toolset.tools}
+        new_tool_name = base_name
+        i = 1
+        while new_tool_name in existing_names:
+            new_tool_name = f"{base_name}_{i}"
+            i += 1
+
+        @tool(name=new_tool_name)
+        def dynamic_tool(user_input: str) -> str:
+            print(f"\n\033[92m[INFO - Tool]'{new_tool_name}'\033[0m")
+            print(f"\033[92m[INFO - Prompt] :\033[0m {prompt}")
+            print(f"\033[92m[INPUT - UserMsg]\033[0m {user_input}")
+            result = llm.run(messages=[
+                ChatMessage.from_system(prompt),
+                ChatMessage.from_user(user_input)
+            ])
+            print(f"\033[92m[INFO - Result]\033[0m {result}")
+            # ✅ Gestione robusta di ChatResult o dict
+            try:
+                reply = result.replies[-1]
+            except AttributeError:
+                reply = result["replies"][-1]
+            if hasattr(reply, "text"):
+                return reply.text
+            elif isinstance(reply, dict) and "text" in reply:
+                return reply["text"]
+            else:
+                return str(reply)
+
+
+        toolset.tools.append(dynamic_tool)
+        return f"✅ Tool '{new_tool_name}' creato con prompt:\n{prompt}"
+
+    except Exception as e:
+        return f"❌ Errore nella creazione del tool: {str(e)}"
+
+# === AGGIUNGI agent_builder al toolset ===
+
+toolset = Toolset([agent_builder, rouge_l_score])
+
+# === PROMPT AGENTE ORCHESTRATORE ===
+AGENT1_PROMPT = """
+You are an autonomous task planner and system designer.
+
+Your job is to:
+- Understand the user's high-level request or problem description.
+- Break the request down into logical sub-tasks or roles, if appropriate.
+- For each role, create an agent that is specialized in that sub-task.
+
+Each agent must have:
+- A short, unique name (alphanumeric and underscores only).
+- A clear and specialized system prompt, written in the second person, that describes what the agent is supposed to do. 
+If the user give a static prompt you have to use it!
+
+You MUST create each agent by calling the agent_builder tool exactly like this:
+agent_builder(input_text="{...json string...}")
+
+The string must be a valid JSON object with keys:
+- "name": the name of the agent
+- "prompt": the agent’s prompt
+
+Never use named arguments like name= or prompt=.
+Do not include explanations or markdown.
+Just invoke the tool once per agent needed.
+
+Always decompose the user's request into smaller, manageable tasks.
+If the task is not actionable, retry or ask the user to clarify.
+"""
+
+# === DEFINISCI L'AGENTE 1 ===
+agent1 = Agent(
+    chat_generator=llm,
+    system_prompt=AGENT1_PROMPT,
+    tools=toolset
+)
+# === INPUT UTENTE ===
+print("\n📝 Enter your software engineering problem (end with Ctrl+D on Linux/macOS or Ctrl+Z + Enter on Windows:\n")
+user_input = sys.stdin.read().strip()
+
+agent1.warm_up()
+# === ESECUZIONE ===
+resp = agent1.run(messages=[
+    ChatMessage.from_user(user_input)
+])
+print (resp)
+output = resp["messages"][-1].text.strip()
+
+print(f"\n🧩 Agent1 decomposition:\n{output}\n")
+print("\n📦 Toolset finale:")
+for tool in toolset.tools:
+    print(f" - {tool.name}")
+
+
+AGENT2_PROMPT = """
+You are a tool inspector.
+
+When the user asks you to inspect or verify the system, you must call all tools available in your toolset and print:
+
+- The name of each tool
+- If it is a static tool (like agent_builder) or a dynamically created one
+- Its static prompt 
+
+Format your response as clean readable text. 
+
+Use the tools one by one to get their details.
+"""
+# agent2 = Agent(
+#     chat_generator=llm,
+#     system_prompt=AGENT2_PROMPT,
+#     tools=toolset  # contiene tutti i tool dinamici creati
+# )
+# agent2.warm_up()
+
+# response = agent2.run(messages=[
+#     ChatMessage.from_user("List and describe all the tools available in this system.")
+# ])
+# print("\n Risposta di agent2:\n")
+#print("\n  Dettagli dei tool creati:\n")
+# print(response["messages"][-1].text)
+
+
+AGENT3_PROMPT = """
+You are a software engineering assistant that help users to create sophisticated software architectures.
+
+When a user describes a software-related task or problem, you must:
+- Understand the request.
+- Check the abilities of the available tools.
+- Delegate to a specialized assistant one task at a time.
+- Never explain or describe which tool you're using.
+- Return all the result 
+If the task is unclear, ask the user for clarification. Never attempt to solve it yourself.
+"""
+
+agent3 = Agent(
+    chat_generator=llm,
+    system_prompt=AGENT3_PROMPT,
+    tools=toolset  # contiene tutti i tool dinamici creati
+)
+agent3.warm_up()
+# print("\n📝 Enter your software engineering problem (end with Ctrl+D on Linux/macOS or Ctrl+Z + Enter on Windows):\n")
+# agent3_user_prompt = sys.stdin.read().strip()
+response = agent3.run(messages=[
+    ChatMessage.from_user(
+        """I am building an AI system to generate short "About" descriptions from README.md files using a multi-agent architecture.
+
+The system should be trained on a dataset of real repositories. For each README, I have a corresponding target description. Your goal is to:
+
+1. For each training example:
+   - Extract the most relevant text from the README.
+   - Generate a short description using a summarizer agent.
+   - Compare the generated summary to the ground-truth description using ROUGE-L.
+   - If the score is below 0.7, propose a better summarizer prompt using a teacher agent.
+
+2. Perform just 1 training iteration for each README (no retries).
+3. Collect the best prompt per README, and combine them using a final prompt combiner agent.
+
+Please begin processing the training set below.
+
+Training README 1:
+---
+"readme": "b'# react-tdd-guide\nA series of examples on how to TDD React\n\n## Getting started\n\n1. install \n- Grab an editor or IDE. I recommend Webstorm, Atom, and VIM, in that order.\n-  ...\n-  OR if v4 of node.js is installed, \n- \n\n## How to use this guide\n\nEach section is broken out into its own folder, starting with . What youll find there is the finished example. I am experimenting with using the  and comments to drive the guide itself. Feedback on whether this works or not would be appreciated.\n\nEach commit that is suffixed with ""- red"" can be checked out separately to examine the failing test. Each commit that is suffixed with ""- green"" shows how I finally passed the failing assertion.\n\nLooking at the history for each section will show you only the steps needed to drive that part of the application.\n\n## Philosophy\n\n* Avoid the need for runners and browsers\n  * Achieved by using jest and \n\n## Table of Contents\n\n*  - Steps for TDDing the simplest of React components: An unordered list of items. Start here if youre not familiar with TDDing React and want to see a simple introduction.\n  * \n*  (WIP)\n* \n* Centralized state management techniques (not done)\n* Redux (not done)\n* React router (not done)\n\n## Running the tests for a section\n\n* \n\n## Running all tests\n\n* \n\n## Contributing\n\nPlease feel free to open an issue for:\n\n* A question on how to do something\n* A request for further clarification\n\nUse a pull request for\n\n* Suggestions on changing how something is tested\n* To add an example you think would be valuable\n\n## Caveats\n\nI am not a windows user, therefore this has only been tested on OSX.\n'"
+
+Training README 2:
+---
+"b'# OpenMTP | Android File Transfer for macOS\n\n- Author: [Ganesh Rathinavel](https://www.linkedin.com/in/ganeshrvel Ganesh Rathinavel)\n- License: [MIT](https://github.com/ganeshrvel/openmtp/blob/master/LICENSE MIT)\n- System Requirements: macOS 11.0 (Big Sur) or higher\n- Website URL: [https://openmtp.ganeshrvel.com](https://openmtp.ganeshrvel.com/ https://openmtp.ganeshrvel.com)\n- Repo URL: [https://github.com/ganeshrvel/openmtp](https://github.com/ganeshrvel/openmtp/ https://github.com/ganeshrvel/openmtp)\n- Contacts: ganeshrvel@outlook.com\n\n## Introduction\n\n### Advanced Android File Transfer Application for macOS.\n\nTransferring files between macOS and Android or any other MTP devices has always been a nightmare. There are a few File Transfer MTP apps which are available online but most of them are either too expensive or come with bad UI/UX. The official ""Android File Transfer"" app for macOS from Google comes with bugs, innumerable limitations, some of which include - not being able to transfer files larger than 4GB, frequent disconnections, unable to rename the folders or files on the android/MTP devices. Most of the other apps available online uses either WiFi or ADB protocol to transfer the files, which is an extremely time-consuming process.\n\nCountless searches to find an app to solve these problems and failing to find one made me restless. So, I took the leap and decided to create an app for us that could help us have a smooth and hassle-free file transfer process from macOS to Android/MTP devices. Created with the objective of giving back to the community, we can all use this app for free in this lifetime.\n\n### Features\n\n- Safe, Transparent and Open-Source\n- Plug and Play via USB. No hassles, easy and instant connection.\n- Select between Internal Memory and SD Card\n- Transfer multiple files which are larger than 4GB\n- Dark mode\n- Drag-and-drop support\n- Split pane views for both Local Computer and Android device\n- Choose between Grid and List view.\n- Use Keyboard Shortcuts to navigate through your files.\n- No collection of personally identifiable information.\n\n### Kalam Kernel\n\nOpenMTP 3.0 features a new MTP kernel and it was written from the scratch. It promises a file copy speed of 30 to 40 MB/s on low and mid range devices and 100 to 120 MB/s on higher end devices. The all new and powerful MTP kernel is named after [Dr. A. P. J. Abdul Kalam](https://en.wikipedia.org/wiki/A._P._J._Abdul_Kalam Dr. A. P. J. Abdul Kalam)\n\nDo checkout the Go package which Ive written to build Kalam Kernel: [github.com/ganeshrvel/go-mtpx](https://github.com/ganeshrvel/go-mtpx https://github.com/ganeshrvel/go-mtpx). Feel free to raise PRs.\n\n### System Requirements and Support\n\n- To support macOS version below Big Sur the Kalam kernel needs to be compiled on an older macOS machine everytime there is an update, which is practically very difficult\n- Only the latest 3 versions of macOS will receive the  Kernel updates, which includes new device supports, fixes, stability improvements. macOS Big Sur (11.0) or above will receive the above said updates\n- We have now officially retired the support for  Kernel on macOS 10.13 (OS X El High Sierra) and lower. Only the ""Legacy"" MTP mode will continue working on these outdated machines.\n- We will continue releasing the updates for both  and  machines\n\n### Installation\n\n- Download the [Mac Apple Silicon](https://openmtp.ganeshrvel.com/?downloadApp=github&release=stable&platform=mac&arch=arm64 Mac Apple Silicon) version\n- Download the [Mac Intel Silicon](https://openmtp.ganeshrvel.com/?downloadApp=github&release=stable&platform=mac&arch=x64 Mac Intel Silicon) version\n- Using Homebrew Cask\n\n\n\n- Find the latest dmg file from [GitHub Releases](https://github.com/ganeshrvel/openmtp/releases GitHub Releases)\n\n### Screengrabs\n\n![OpenMTP File Explorer](https://github.com/ganeshrvel/openmtp/raw/master/blobs/images/file-explorer-bluebg.jpg OpenMTP File Explorer)\n\n![OpenMTP File Transfer](https://github.com/ganeshrvel/openmtp/raw/master/blobs/images/file-transfer-bluebg.jpg OpenMTP File Transfer)\n\n### Keyboard Shortcuts\n\n| Command                                           | Keyboard Shortcut                                                            |\n| ------------------------------------------------- | ---------------------------------------------------------------------------- |\n| Delete                                            | backspace                                                         |\n| New Folder                                        | command (\xe2\x8c\x98)+n                                          |\n| Copy                                              | command (\xe2\x8c\x98)+c                                          |\n| Copy to Queue                                     | command (\xe2\x8c\x98)+shift+c                         |\n| Paste                                             | command (\xe2\x8c\x98)+v                                          |\n| Refresh                                           | command (\xe2\x8c\x98) +r                                         |\n| Folder Up                                         | command (\xe2\x8c\x98)+b                                          |\n| Select All                                        | command (\xe2\x8c\x98)+a                                          |\n| Rename                                            | command (\xe2\x8c\x98)+d                                          |\n| Switch Tab                                        | command(\xe2\x8c\x98)+1                                           |\n| Open                                              | enter                                                             |\n| Navigate Left                                     | left                                                              |\n| Navigate Right                                    | right                                                             |\n| Navigate Up                                       | up                                                                |\n| Navigate Down                                     | down                                                              |\n| Select Multiple Items Forward (in Grid View)  | shift+left                                             |\n| Select Multiple Items Backward (in Grid View) | shift+right                                            |\n| Select Multiple Items Forward (in List View)  | shift+up                                               |\n| Select Multiple Items Backward (in List View) | shift+down                                             |\n| Select Multiple Items (with mouse)            | command (\xe2\x8c\x98)+click or shift+click |\n\n## Building from Source\n\nRequirements: [Node.js v16](https://nodejs.org/en/download/ Install Node.js v16), [Git](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git Install Git) and [Yarn package manager](https://yarnpkg.com/lang/en/docs/install/ Install Yarn package manager)\n\n### Clone\n\n\n\n\n\n### Run\n\nA fresh clone might throw undefined state error. Run the following commands once to fix the issue.\n\n\n\n\n\n### Debugging a Packaged app\n\n\n\n- Open a Chromium browser\n- Input ""about://inpsect"" into the URL bar\n- Add a new connection \n- Inpect OpenMTP @ port \n\n### Publishing using CI/CD:\n\n- CodeMagic.io\n  - Create a new App (Choose others -> Enter Electron)\n  - Environment variables:\n    - : \n    - : \n      - Log into your [Apple Account](https://appleid.apple.com/account/manage Apple Account)\n      - Goto Sign-In and Security > App-Specific Passwords\n      - Click on Generate Password..., enter a password label and click Create\n      - Copy the displayed app-specific-password\n    - : \n    - : \n    - : \n    - : \n      - Find it from here: \n      - Scopes: \n    - : \n      - Find it from here: \n      - Scopes: \n    - :\n      - Keychain ->  menu in the left -> Login -> My Certificates\n      - Search for  in the top search bar\n        - If there are no results for the , for the organization, create one from here: \n        - Follow these steps to get the Apple Developer certificated installed in the local machine \n      - Search for  in the top search bar\n      - Expand \n      - See if the private keys name matches this: \n        - Else rename the private key as (right click -> get info) \n        - Close the window\n      - Right Click on the private key -> \n      - Export \n      - File name: \n      - Enter Password. This is the , note this down\n      - Run (this step doesnt work if you are using fig or ohmyzsh, use raw terminal):\n        - \n      - Copy the whole content of the file \n      - Paste the content as the value for the field \n    -  is the password from the above step\n    - : \n      - Find it from here: \n    - : \n      - Find the relevant workflow id from , (mostly )\n    - : \n      - Find the relevant workflow id from , (mostly )\n    - : \n    - : \n    - : \n    - : \n    - References:\n      - \n      - \n\n### Packaging (locally) and Publishing\n\nSetup the code signing to build, package (locally) and publish the app.\n\nApp Notarization for macOS (skip this section for non macOS builds)\n\n- Rename sample.env file as .env\n- To update  and  in .env file\n- Log into your [Apple Account](https://appleid.apple.com/account/manage Apple Account)\n- Goto Sign-In and Security > App-Specific Passwords\n- Click on Generate Password..., enter a password label and click Create\n- Copy the displayed app-specific-password\n- Run\n\n\n\n- Log into your [Apple App Store Connect Account](https://appstoreconnect.apple.com/agreements/# Apple App Store Connect Account) and accept the presented terms and conditions\n- The statuses shall turn Active\n\nSentry\n\n- Auth Tokens Settings page: \n\n\n\nPackaging\nInstructions: [https://www.electron.build/code-signing](https://www.electron.build/code-signing https://www.electron.build/code-signing)\n\n\n\n\n\n### Technical Features\n\n- Built using Electron v17 and React v18\n- Loadables, Dynamic Reducer Injection, Selectors for code splitting and performance optimization\n- Hot module reload (HMR) for instant feedback\n- Inbuilt error logging and profile/settings management\n- Industry standard state management\n- JSS, SASS/SCSS styling\n- Port assigned: 4642\n\n### Configurations\n\n- config/env/env.dev.js and config/env/env.prod.js contain the PORT number of the app.\n- config/dev-app-update.yml file holds the GitHub repo variables required by electron-updater.\n- config/google-analytics-key.js file contains the Google Analytics Tracking ID.\n- package.json build.publish object holds the values for publishing the packaged application.\n- app/constants folder contains all the constants required by the app.\n\n### Debugging\n\n#### Debugging Guide\n\n[https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/400](https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/400 Debugging Guide)\n\n#### Dispatching redux actions from the main process\n\n[https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/118](https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/118 https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/118)\n\n[https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/108](https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/108 https://github.com/electron-react-boilerplate/electron-react-boilerplate/issues/108)\n\n#### VM112:2 Uncaught TypeError: Cannot read property \n\n\n\n### Troubleshooting\n\n#### Your device is not recognized\n\n#### node-mac-permissions throws \n\n- On macOS <= 10.14.x (mojave) the  will throw a npm-rebuild error\n- To ""test"" or ""debug"" the app on macOS mojave:\n  - remove the  dependency from \n  - Add the ignorePlugin line to  in the file \n    - \n  - WARNING: DO NOT commit these changes to the upstream!!\n- The  constant defines the minimum os version that is required to show the macos usage access permission popup\n- For distribution make sure to build the app on a machine which is at least 10.15 (Catalina)\n\n[https://stackoverflow.com/questions/58358449/notarizing-electron-apps-throws-you-must-first-sign-the-relevant-contracts-on](https://stackoverflow.com/questions/58358449/notarizing-electron-apps-throws-you-must-first-sign-the-relevant-contracts-on https://stackoverflow.com/questions/58358449/notarizing-electron-apps-throws-you-must-first-sign-the-relevant-contracts-on)\n\n- Raise an issue if your device is undetected: https://github.com/ganeshrvel/openmtp/issues/new?template=contribute.md\n\n#### The app goes blank while trying to connect a Samsung device\n\n- Uninstall Samsung SmartSwitch, if installed: [https://farazfazli.medium.com/how-i-reverse-engineered-keis-and-sidesync-and-fixed-mtp-8949acbb1c29](https://farazfazli.medium.com/how-i-reverse-engineered-keis-and-sidesync-and-fixed-mtp-8949acbb1c29 https://farazfazli.medium.com/how-i-reverse-engineered-keis-and-sidesync-and-fixed-mtp-8949acbb1c29), [https://github.com/ganeshrvel/openmtp/issues/212](https://github.com/ganeshrvel/openmtp/issues/212 https://github.com/ganeshrvel/openmtp/issues/212).\n\n#### Notarizing Electron apps throws - \xe2\x80\x9cYou must first sign the relevant contracts online. (1048)\xe2\x80\x9d error\n\n[https://stackoverflow.com/questions/58358449/notarizing-electron-apps-throws-you-must-first-sign-the-relevant-contracts-on](https://stackoverflow.com/questions/58358449/notarizing-electron-apps-throws-you-must-first-sign-the-relevant-contracts-on https://stackoverflow.com/questions/58358449/notarizing-electron-apps-throws-you-must-first-sign-the-relevant-contracts-on)\n\n### More repos\n\n- [npm: electron-root-path](https://github.com/ganeshrvel/npm-electron-root-path Get the root path of an Electron Application)\n- [Electron React Redux Advanced Boilerplate](https://github.com/ganeshrvel/electron-react-redux-advanced-boilerplate Electron React Redux advanced boilerplate)\n- [Tutorial Series by Ganesh Rathinavel](https://github.com/ganeshrvel/tutorial-series-ganesh-rathinavel Tutorial Series by Ganesh Rathinavel)\n\n### Credits\n\n- A special thanks to [CodeMagic](http://codemagic.io/ Codemagic - CI/CD) and [Kevin Suhajda](https://www.linkedin.com/in/kevinsuhajda Kevin Suhajda) for sponsoring their CI/CD VMs, thus making the app releases more streamlined and much easier now. \xf0\x9f\x8e\x8a\xf0\x9f\x8e\x8a Do checkout their [products](https://codemagic.io/integrations Codemagic - integrations) section for more.\n\n- Special shoutout to [@CodyJung](https://github.com/CodyJung CodyJung) for adding the  and  devices support. \xf0\x9f\x94\xa5\xf0\x9f\x94\xa5\n\n- Thanks to Ms [Ayushi Bothra](https://www.linkedin.com/in/ayushi-bothra-3103/ Ayushi Bothra) for contributing to the documentation and pages.\n\n- App logo was contributed by [Shubhendu Mitra](https://www.linkedin.com/in/shubhendum/ Shubhendu Mitra - LinkedIn). Make sure to check out more of his works on [Behance](https://www.behance.net/soponhara Shubhendu Mitra - Behance).\n\n- Thanks to [Vladimir Menshakov](https://github.com/whoozle Vladimir Menshakov) for [android-file-transfer-linux](https://github.com/whoozle/android-file-transfer-linux android-file-transfer-linux) (the MTP legacy Kernel)\n\n- Shoutout to [@yennsarah](https://github.com/yennsarah yennsarah), , [@riginoommen](https://github.com/riginoommen riginoommen), [@AjithKumarvm](https://github.com/AjithKumarvm AjithKumarvm), , Dick Cowan, Kjell Dankert, Thorolf E.R. Wei\xc3\x9fhuhn and to all other community members who helped me test the application.\n\n- This app was built upon [https://github.com/ganeshrvel/electron-react-redux-advanced-boilerplate](https://github.com/ganeshrvel/electron-react-redux-advanced-boilerplate https://github.com/ganeshrvel/electron-react-redux-advanced-boilerplate) which is a heavily modified fork of [https://github.com/electron-react-boilerplate/electron-react-boilerplate](https://github.com/electron-react-boilerplate/electron-react-boilerplate https://github.com/electron-react-boilerplate/electron-react-boilerplate).\n\n- The icons used in the app were made by ,  and  which is licensed under [CC 3.0 BY](https://creativecommons.org/licenses/by/3.0/ Creative Commons BY 3.0).\n\n- The ""no image found"" icon was made by [Phonlaphat Thongsriphong](https://www.iconfinder.com/phatpc Phonlaphat Thongsriphong).\n\n### Contribute\n\nIf you are interested in fixing issues and contributing directly to the code base, please see the [guidelines](https://github.com/ganeshrvel/openmtp/blob/master/CONTRIBUTING.md guidelines).\n\n### Support OpenMTP\n\nHelp me keep the app FREE and open for all.\n\n- Donate Via PayPal: [paypal.me/ganeshrvel](https://paypal.me/ganeshrvel https://paypal.me/ganeshrvel)\n- Buy Me A Coffee (UPI, PayPal, Credit/Debit Cards, Internet Banking): [buymeacoffee.com/ganeshrvel](https://buymeacoffee.com/ganeshrvel https://buymeacoffee.com/ganeshrvel)\n\n### Contacts\n\nPlease feel free to contact me at ganeshrvel@outlook.com\n\n### License\n\nOpenMTP | Android File Transfer for macOS is released under [MIT License](https://github.com/ganeshrvel/openmtp/blob/master/LICENSE MIT License).\n\nCopyright \xc2\xa9 2018-Present Ganesh Rathinavel\n'"
+"""
+    )
+])
+# response = agent3.run(messages=[
+#     ChatMessage.from_user(agent3_user_prompt)
+# ])
+
+
+for msg in response["messages"]:
+    if msg.role == ChatRole.TOOL:
+        for content in msg._content:  # <-- attenzione: underscore!
+            if isinstance(content, ToolCallResult):
+                print(f"🔧 Tool name: {content.origin.tool_name}")
+                print(f"📥 Tool input: {content.origin.arguments}")
+                print("✅ Tool result:")
+                print(content.result)
+                print("\n" + "-"*80 + "\n")
